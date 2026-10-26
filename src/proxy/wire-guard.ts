@@ -1,6 +1,7 @@
 /**
  * Anti-Ban & Official Client Wire Guard
- * Replicates official Omnirush CLI & Desktop wire signatures (from omnirush@2.4.3),
+ * Replicates the current official OmniRush CLI wire signature for the installed
+ * OmniRush release, and handles one-time Refresh Token Rotation (RTR).
  * handles one-time Refresh Token Rotation (RTR), and detects account suspension notices.
  */
 
@@ -16,7 +17,7 @@ export interface AccountBanCheckResult {
   readonly reason?: string | undefined;
 }
 
-export const OFFICIAL_VERSION = "2.4.3";
+export const OFFICIAL_VERSION = "2.7.0";
 
 const BAN_PATTERNS: readonly RegExp[] = [
   /closed\s+automatically/i,
@@ -82,15 +83,20 @@ export function generateRealisticDeviceName(): string {
 
 /**
  * Constructs official headers for model requests (/responses, /chat/completions)
- * Matches official token-proxy.js lines 278-295:
+ * Matches the installed official token-proxy.js request policy:
  * - User-Agent: "omnirush" (bare product name, versioned "omnirush/x" is refused as lookalike)
- * - X-OmniRush-Client: "cli/2.4.3"
- * - x-omnirush-session-id: <uuid>
+ * - X-OmniRush-Client: "cli/2.7.0"
+ * - x-omnirush-session-id: a session id in the official `ses_...` shape
  */
 export function createAntiBanHeaders(
   options: AntiBanHeaderOptions
 ): Record<string, string> {
-  const sessionId = options.requestId ?? `sess-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+  const generated = typeof globalThis.crypto?.randomUUID === "function"
+    ? globalThis.crypto.randomUUID().replaceAll("-", "")
+    : `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 22)}`;
+  const sessionId = options.requestId?.startsWith("ses_")
+    ? options.requestId
+    : `ses_${generated}`;
 
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
@@ -106,7 +112,7 @@ export function createAntiBanHeaders(
 
 /**
  * Constructs official headers for device authentication endpoints (/device/*)
- * Matches official auth.js lines 68-94:
+ * Matches the installed official auth.js request policy:
  * - User-Agent: "omnirush/<version> (<platform>; <arch>)"
  * - X-OmniRush-Client: "cli/<version>"
  */

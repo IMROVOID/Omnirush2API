@@ -6,6 +6,7 @@ import {
   transformUpstreamChunk,
   formatSSEChunk,
   SSE_DONE_MESSAGE,
+  aggregateResponsesSSE,
 } from "../../src/proxy/stream-transformer.js";
 
 describe("stream-transformer", () => {
@@ -67,5 +68,26 @@ describe("stream-transformer", () => {
     assert.ok(sse.startsWith("data: {"));
     assert.ok(sse.endsWith("\n\n"));
     assert.equal(SSE_DONE_MESSAGE, "data: [DONE]\n\n");
+  });
+
+  it("aggregates the current OmniRush Responses SSE format", () => {
+    const raw = [
+      "event: response.created",
+      'data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-6-astra"}}',
+      "",
+      "event: response.output_text.delta",
+      'data: {"type":"response.output_text.delta","delta":"Hello"}',
+      "",
+      "event: response.output_text.delta",
+      'data: {"type":"response.output_text.delta","delta":" world"}',
+      "",
+      "event: response.completed",
+      'data: {"type":"response.completed","response":{"id":"resp_1","model":"gpt-6-astra","usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}}',
+    ].join("\n");
+
+    const result = aggregateResponsesSSE(raw, "gpt-6-astra");
+    assert.equal(result.id, "resp_1");
+    assert.equal(result.content, "Hello world");
+    assert.deepEqual(result.usage, { prompt_tokens: 2, completion_tokens: 3, total_tokens: 5 });
   });
 });

@@ -57,7 +57,7 @@ function getModelList() {
 }
 
 // src/proxy/wire-guard.ts
-var OFFICIAL_VERSION = "2.4.3";
+var OFFICIAL_VERSION = "2.7.0";
 var BAN_PATTERNS = [
   /closed\s+automatically/i,
   /unofficial\s+client/i,
@@ -90,7 +90,8 @@ function detectPlatformSignature() {
   return "win32";
 }
 function createAntiBanHeaders(options) {
-  const sessionId = options.requestId ?? `sess-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+  const generated = typeof globalThis.crypto?.randomUUID === "function" ? globalThis.crypto.randomUUID().replaceAll("-", "") : `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 22)}`;
+  const sessionId = options.requestId?.startsWith("ses_") ? options.requestId : `ses_${generated}`;
   const headers = {
     "Content-Type": "application/json",
     Accept: options.isStream ? "text/event-stream" : "application/json",
@@ -423,9 +424,77 @@ var AccountPoolManager = class {
 };
 
 // src/proxy/normalizer.ts
+function blockText(value) {
+  if (typeof value === "string") return value;
+  if (!Array.isArray(value)) return value == null ? "" : JSON.stringify(value);
+  return value.map((part) => {
+    if (typeof part === "string") return part;
+    if (part && typeof part === "object" && typeof part.text === "string") return part.text;
+    return "";
+  }).join("");
+}
+function textParts(content, type, role) {
+  if (typeof content === "string") return [{ type, text: content }];
+  if (content === null) return [];
+  if (!Array.isArray(content)) return [];
+  const blocks = [];
+  for (const part of content) {
+    if (typeof part === "string") {
+      blocks.push({ type, text: part });
+      continue;
+    }
+    if (!part || typeof part !== "object") continue;
+    const value = part;
+    const kind = typeof value.type === "string" ? value.type : "text";
+    if (kind === "text") {
+      if (typeof value.text === "string") blocks.push({ type, text: value.text });
+      continue;
+    }
+    if (kind === "thinking" || kind === "redacted_thinking") continue;
+    if (kind === "tool_result") {
+      blocks.push({
+        type: "function_call_output",
+        call_id: typeof value.tool_use_id === "string" ? value.tool_use_id : "unknown",
+        output: blockText(value.content)
+      });
+      continue;
+    }
+    if (kind === "tool_use") {
+      blocks.push({
+        type: "function_call",
+        call_id: typeof value.id === "string" ? value.id : "unknown",
+        name: typeof value.name === "string" ? value.name : "tool",
+        arguments: typeof value.input === "string" ? value.input : JSON.stringify(value.input ?? {})
+      });
+      continue;
+    }
+    if (kind === "input_text" || kind === "output_text" || kind === "input_image" || kind === "image_url") {
+      blocks.push(value);
+      continue;
+    }
+    if (role === "user" && typeof value.text === "string") blocks.push({ type, text: value.text });
+  }
+  return blocks;
+}
+function normalizeInput(request) {
+  if (Array.isArray(request.input)) return request.input;
+  return request.messages.map((message) => {
+    if (message.role === "tool") {
+      return {
+        type: "function_call_output",
+        call_id: message.tool_call_id ?? "unknown",
+        output: typeof message.content === "string" ? message.content : JSON.stringify(message.content ?? "")
+      };
+    }
+    return {
+      role: message.role,
+      ...message.name ? { name: message.name } : {},
+      content: textParts(message.content, message.role === "assistant" ? "output_text" : "input_text", message.role)
+    };
+  });
+}
 function normalizeCompletionRequest(request) {
   const targetModel = resolveModelId(request.model);
-  const stream = request.stream === true;
   let reasoning;
   if (request.reasoning_effort) {
     reasoning = {
@@ -440,14 +509,17 @@ function normalizeCompletionRequest(request) {
   }
   return {
     model: targetModel,
-    messages: request.messages,
-    input: request.messages,
-    stream,
+    input: normalizeInput(request),
+    // The OmniRush Responses gateway requires streaming, even when the local
+    // OpenAI-compatible caller asks for a non-streaming chat completion.
+    stream: true,
+    store: false,
     ...typeof request.temperature === "number" ? { temperature: request.temperature } : {},
     ...typeof request.top_p === "number" ? { top_p: request.top_p } : {},
-    ...typeof request.max_tokens === "number" ? { max_tokens: request.max_tokens } : {},
+    ...typeof request.max_output_tokens === "number" ? { max_output_tokens: request.max_output_tokens } : typeof request.max_tokens === "number" ? { max_output_tokens: request.max_tokens } : {},
     ...request.stop ? { stop: request.stop } : {},
-    ...reasoning ? { reasoning } : {}
+    ...reasoning ? { reasoning } : {},
+    ...reasoning ? { include: ["reasoning.encrypted_content"] } : {}
   };
 }
 function normalizeCompletionResponse(raw, fallbackModel) {
@@ -473,13 +545,15 @@ function normalizeCompletionResponse(raw, fallbackModel) {
         finish_reason: c["finish_reason"] ?? "stop"
       };
     });
-  } else if (typeof data["output"] === "string") {
+  } else if (typeof data["content"] === "string" || typeof data["output"] === "string") {
+    const reasoning = typeof data["reasoningContent"] === "string" ? data["reasoningContent"] : void 0;
     choices = [
       {
         index: 0,
         message: {
           role: "assistant",
-          content: data["output"]
+          content: typeof data["content"] === "string" ? data["content"] : data["output"],
+          ...reasoning ? { reasoning_content: reasoning } : {}
         },
         finish_reason: "stop"
       }
@@ -552,7 +626,33 @@ function createChunkDelta(options) {
   };
 }
 function transformUpstreamChunk(upstream, requestedModel) {
-  const id = typeof upstream["id"] === "string" ? upstream["id"] : `chatcmpl-${Date.now()}`;
+  const response = upstream["response"] && typeof upstream["response"] === "object" ? upstream["response"] : null;
+  const id = typeof upstream["id"] === "string" ? upstream["id"] : response && typeof response["id"] === "string" ? response["id"] : `chatcmpl-${Date.now()}`;
+  const eventType = typeof upstream["type"] === "string" ? upstream["type"] : "";
+  if (eventType === "response.output_text.delta") {
+    return createChunkDelta({
+      id,
+      model: requestedModel,
+      content: typeof upstream["delta"] === "string" ? upstream["delta"] : ""
+    });
+  }
+  if (/^response\.(reasoning|summary).*\.delta$/.test(eventType)) {
+    return createChunkDelta({
+      id,
+      model: requestedModel,
+      reasoningContent: typeof upstream["delta"] === "string" ? upstream["delta"] : ""
+    });
+  }
+  if (eventType === "response.output_item.added") {
+    const item = upstream["item"];
+    if (item && typeof item === "object" && item["role"] === "assistant") {
+      return createChunkDelta({ id, model: requestedModel, role: "assistant" });
+    }
+    return null;
+  }
+  if (eventType === "response.completed") {
+    return createChunkDelta({ id, model: requestedModel, finishReason: "stop" });
+  }
   const choicesRaw = Array.isArray(upstream["choices"]) ? upstream["choices"] : [];
   if (choicesRaw.length > 0) {
     const choices = [];
@@ -608,6 +708,7 @@ function createSSETransformStream(requestedModel) {
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
   let buffer = "";
+  let responseId = `chatcmpl-${Date.now()}`;
   return new TransformStream({
     transform(chunk, controller) {
       buffer += decoder.decode(chunk, { stream: true });
@@ -620,7 +721,9 @@ function createSSETransformStream(requestedModel) {
           return;
         }
         if (parsed !== null) {
-          const transformed = transformUpstreamChunk(parsed, requestedModel);
+          const response = parsed.response && typeof parsed.response === "object" ? parsed.response : null;
+          if (response && typeof response.id === "string") responseId = response.id;
+          const transformed = transformUpstreamChunk({ id: responseId, ...parsed }, requestedModel);
           if (transformed !== null) {
             controller.enqueue(encoder.encode(formatSSEChunk(transformed)));
           }
@@ -633,7 +736,9 @@ function createSSETransformStream(requestedModel) {
         if (parsed === "[DONE]") {
           controller.enqueue(encoder.encode(SSE_DONE_MESSAGE));
         } else if (parsed !== null) {
-          const transformed = transformUpstreamChunk(parsed, requestedModel);
+          const response = parsed.response && typeof parsed.response === "object" ? parsed.response : null;
+          if (response && typeof response.id === "string") responseId = response.id;
+          const transformed = transformUpstreamChunk({ id: responseId, ...parsed }, requestedModel);
           if (transformed !== null) {
             controller.enqueue(encoder.encode(formatSSEChunk(transformed)));
           }
@@ -642,6 +747,60 @@ function createSSETransformStream(requestedModel) {
       controller.enqueue(encoder.encode(SSE_DONE_MESSAGE));
     }
   });
+}
+function responseOutputText(value) {
+  if (!Array.isArray(value)) return "";
+  const text = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object") continue;
+    const record = item;
+    const content = record.content;
+    if (!Array.isArray(content)) continue;
+    for (const part of content) {
+      if (part && typeof part === "object" && typeof part.text === "string") {
+        const partText = part.text;
+        if (typeof partText === "string") text.push(partText);
+      }
+    }
+  }
+  return text.join("");
+}
+function aggregateResponsesSSE(text, requestedModel) {
+  let id = `chatcmpl-${Date.now()}`;
+  let model = requestedModel;
+  let content = "";
+  let reasoningContent = "";
+  let usage;
+  for (const line of text.split(/\r?\n/)) {
+    const parsed = parseSSELine(line);
+    if (!parsed || parsed === "[DONE]") continue;
+    const type = typeof parsed.type === "string" ? parsed.type : "";
+    const response = parsed.response && typeof parsed.response === "object" ? parsed.response : null;
+    const eventId = typeof parsed.response_id === "string" ? parsed.response_id : response && typeof response.id === "string" ? response.id : null;
+    if (eventId) id = eventId;
+    const eventModel = response && typeof response.model === "string" ? response.model : null;
+    if (eventModel) model = eventModel;
+    if (type === "response.output_text.delta" && typeof parsed.delta === "string") content += parsed.delta;
+    if (/^response\.(reasoning|summary).*\.delta$/.test(type) && typeof parsed.delta === "string") reasoningContent += parsed.delta;
+    if (type === "response.completed" && response) {
+      if (!content) content = responseOutputText(response.output);
+      const rawUsage = response.usage;
+      if (rawUsage && typeof rawUsage === "object") {
+        const value = rawUsage;
+        const prompt = typeof value.input_tokens === "number" ? value.input_tokens : typeof value.prompt_tokens === "number" ? value.prompt_tokens : 0;
+        const completion = typeof value.output_tokens === "number" ? value.output_tokens : typeof value.completion_tokens === "number" ? value.completion_tokens : 0;
+        const total = typeof value.total_tokens === "number" ? value.total_tokens : prompt + completion;
+        usage = { prompt_tokens: prompt, completion_tokens: completion, total_tokens: total };
+      }
+    }
+  }
+  return {
+    id,
+    model,
+    content,
+    ...reasoningContent ? { reasoningContent } : {},
+    ...usage ? { usage } : {}
+  };
 }
 
 // src/proxy/completion-handler.ts
@@ -673,7 +832,7 @@ var CompletionProxyHandler = class {
     const targetModel = resolveModelId(request.model);
     const normalizedPayload = normalizeCompletionRequest(request);
     const isStream = request.stream === true;
-    const maxAttempts = Math.max(1, this.pool.getStats().total);
+    const maxAttempts = Math.max(2, this.pool.getStats().total);
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       if (signal?.aborted) {
         return {
@@ -717,7 +876,9 @@ var CompletionProxyHandler = class {
       const headers = createAntiBanHeaders({
         accessToken: account.accessToken ?? "",
         requestId,
-        isStream
+        // The OmniRush Responses gateway currently requires stream=true for
+        // every model request. We aggregate it below for non-stream callers.
+        isStream: true
       });
       const timeoutSignal = AbortSignal.timeout(this.requestTimeoutMs);
       const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
@@ -748,7 +909,7 @@ var CompletionProxyHandler = class {
         }
         if (response.status === 401) {
           this.pool.invalidateAccountToken(account.id);
-          this.pool.markCooldown(account.id, 1e4, "HTTP 401 Unauthorized");
+          this.pool.markCooldown(account.id, 0, "HTTP 401 Unauthorized; refreshing access token");
           continue;
         }
         if (response.status === 429) {
@@ -759,7 +920,7 @@ var CompletionProxyHandler = class {
         }
         let parsedJson = {};
         try {
-          parsedJson = JSON.parse(responseText);
+          parsedJson = response.headers.get("content-type")?.includes("text/event-stream") ? aggregateResponsesSSE(responseText, targetModel) : JSON.parse(responseText);
         } catch {
           return {
             status: response.status,
@@ -787,6 +948,7 @@ var CompletionProxyHandler = class {
           }
         };
       } catch (err) {
+        console.error(`[Omnirush2API] upstream request failed: ${err instanceof Error ? err.message : String(err)}`);
         if (signal?.aborted) {
           return {
             status: 499,

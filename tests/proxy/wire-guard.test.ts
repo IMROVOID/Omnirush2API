@@ -44,15 +44,15 @@ describe("anti-ban wire guard & ban protection", () => {
 
     // Required official client signatures (matching omnirush@2.4.3 token-proxy.js)
     assert.equal(headers["User-Agent"], "omnirush");
-    assert.equal(headers["X-OmniRush-Client"], "cli/2.4.3");
-    assert.equal(headers["x-omnirush-session-id"], "sess-123");
+    assert.equal(headers["X-OmniRush-Client"], "cli/2.7.0");
+    assert.match(headers["x-omnirush-session-id"] ?? "", /^ses_/);
     assert.equal(headers["Authorization"], "Bearer mock_acc_token");
     assert.equal(headers["Accept"], "text/event-stream");
 
     // Test official auth API headers
     const authHeaders = createAuthApiHeaders();
-    assert.ok(authHeaders["User-Agent"]?.startsWith("omnirush/2.4.3 ("));
-    assert.equal(authHeaders["X-OmniRush-Client"], "cli/2.4.3");
+    assert.ok(authHeaders["User-Agent"]?.startsWith("omnirush/2.7.0 ("));
+    assert.equal(authHeaders["X-OmniRush-Client"], "cli/2.7.0");
   });
 
   it("generates realistic device names and platform signatures", () => {

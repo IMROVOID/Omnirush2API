@@ -4,6 +4,13 @@ import os from "node:os";
 import type { DiscoveredCredential } from "../types/auth.js";
 import { DEFAULT_GATEWAY_URL } from "./oauth-client.js";
 
+function normalizeGatewayUrl(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  const trimmed = value.trim().replace(/\/+$/, "");
+  if (!trimmed) return undefined;
+  return trimmed.endsWith("/v1") ? trimmed : `${trimmed}/v1`;
+}
+
 /**
  * Parses raw text contents of an OmniRush credential file
  */
@@ -45,7 +52,7 @@ export function parseCredentialFileContent(
       path: sourcePath,
       refreshToken: refreshToken.trim(),
       accessToken: accessToken?.trim(),
-      gatewayUrl: gatewayUrl?.trim(),
+      gatewayUrl: normalizeGatewayUrl(gatewayUrl),
       email: email?.trim(),
     };
   } catch {
@@ -94,6 +101,11 @@ export function getStandardCredentialPaths(): string[] {
 
   // Also check ~/.omnirush2api/tokens.json
   paths.push(path.join(home, ".omnirush2api", "tokens.json"));
+
+  // The official OmniRush CLI stores the signed-in device pair here. Supporting
+  // this file lets the router reuse an existing `omnirush login` session without
+  // asking the user to copy refresh tokens into another config file.
+  paths.push(path.join(home, ".omnirush", "auth.json"));
 
   return paths;
 }

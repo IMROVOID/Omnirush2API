@@ -21,8 +21,14 @@ describe("normalizer", () => {
     const normalized = normalizeCompletionRequest(rawReq);
     assert.equal(normalized.model, "gpt-6-astra");
     assert.equal(normalized.stream, true);
-    assert.equal(normalized.messages.length, 2);
+    assert.equal(normalized.input.length, 2);
+    assert.deepEqual(normalized.input[1], {
+      role: "user",
+      content: [{ type: "input_text", text: "Hello world" }],
+    });
+    assert.equal(normalized.store, false);
     assert.deepEqual(normalized.reasoning, { effort: "high", summary: "auto" });
+    assert.deepEqual(normalized.include, ["reasoning.encrypted_content"]);
   });
 
   it("assigns default medium reasoning effort to reasoning models if not specified", () => {

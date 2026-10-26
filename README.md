@@ -51,8 +51,8 @@ However, access to Omnirush quotas is locked behind OAuth device authentication 
 
 **Omnirush2API** bridges this gap:
 
-1. It integrates with Omnirush's OAuth Device Flow (`omnirush2api login`) and automatically auto-discovers local credentials from the official desktop app on Windows, macOS, and Linux, proactively rotating access tokens before expiration.
-2. It serves a standard OpenAI-compatible gateway (`/v1/chat/completions`, `/v1/responses`, `/v1/models`, `/v1/health`) with Server-Sent Events (SSE) streaming and deep thinking reasoning preservation (`delta.reasoning_content`).
+1. It integrates with OmniRush's OAuth Device Flow and can reuse the official CLI's existing `~/.omnirush/auth.json` session without copying credentials into this repository. It also supports the reference project's token store and rotates access tokens before expiration.
+2. It serves OpenAI-compatible routes (`/v1/chat/completions`, `/v1/responses`, `/v1/models`, `/v1/health`) and a text-focused Anthropic-compatible Messages route (`/v1/messages`, `/v1/messages/count_tokens`) with Server-Sent Events (SSE) streaming.
 3. It supports both a zero-dependency **Local CLI Daemon** (`localhost:20129`) and a standalone **Cloudflare Worker** (`worker/worker.js`) with multi-account round-robin rotation and automated 429 quota exhaustion fallback.
 
 > **Disclaimer**: This tool is provided strictly for personal educational and interoperability testing purposes. Extracting or reusing OAuth credentials outside official clients carries the risk of account suspension or ban. See [Disclaimer & Legal Notice](#disclaimer--legal-notice).
@@ -68,9 +68,11 @@ However, access to Omnirush quotas is locked behind OAuth device authentication 
 - **Multi-Account Round-Robin**: Pool multiple refresh tokens; requests distribute automatically across accounts.
 - **Intelligent 429 Failover**: Automatically detects rate limits and quota caps (`Retry-After`), parks the exhausted account in cooldown, and retries the request transparently with the next ready account.
 - **Streaming SSE with Reasoning Delta**: Preserves thinking blocks in `delta.reasoning_content` for real-time rendering in coding assistants.
-- **Anti-Ban Wire Guard & Signature Masquerading**:
-  - Emulates official OmniRush Electron desktop client headers (`User-Agent: OmniRush/1.2.4`, `Sec-Ch-Ua`, `Sec-Fetch-*`).
-  - Zero unofficial client signature leaks (strips custom headers; generates realistic device hostnames like `DESKTOP-XXXXXX`).
+- **Current Responses wire format**: Sends the current OmniRush request shape (`input`, `stream: true`, `store: false`) and aggregates the required upstream stream for non-streaming callers.
+- **Anthropic Messages compatibility**: Accepts `x-api-key` or Bearer authentication and translates text messages and streaming text deltas to the Anthropic event shape.
+- **Official CLI wire compatibility**:
+  - Uses the current CLI client label (`User-Agent: omnirush`, `X-OmniRush-Client: cli/2.7.0`) and `ses_...` request session IDs.
+  - Does not bypass account checks, quotas, or upstream authentication; a rejected account is quarantined and surfaced as an error.
   - Per-account concurrency locks prevent overlapping requests from triggering "simultaneous sign-in from another place" detection.
   - Automated ban detection permanently quarantines closed/suspended accounts from the pool to protect remaining accounts.
 - **Safe & Resource-Bounded**:
@@ -274,6 +276,35 @@ node dist/cli.js start --port 20129 --key sk-my-secret-key
 ```
 
 Your local endpoint is available at `http://localhost:20129/v1`.
+
+#### Termux + Claude Code Router
+
+CCR can sit in front of the daemon without exposing the OmniRush credential:
+
+```text
+CCR provider name: OmniRush Local
+Provider id:       Local
+OpenAI base URL:   http://127.0.0.1:20129/v1
+Anthropic base URL:http://127.0.0.1:20129
+Client API key:    the local key passed to `start --key`
+Models:            gpt-6-astra, gpt-6.1-sol, gpt-6-sol
+```
+
+For a local-only setup, configure Claude Code's default model as
+`Local/gpt-6.1-sol` and the reasoning slot as `Local/gpt-6-astra`. Keep CCR's
+fallback mode **off** (or set retry count to zero) so a failed local request is
+not replayed against unrelated providers and does not spend additional quota.
+
+The daemon must be running in the Ubuntu/Termux environment before Claude Code
+sends its first request. A small shell wrapper can start it with
+`proot-distro login ubuntu -- bash -lc 'cd /root/Omnirush2API && node dist/cli.js start --port 20129 --key <local-key>'`
+and then execute `claude`. The daemon reads the official CLI auth pair from
+`~/.omnirush/auth.json`; no refresh token belongs in CCR settings.
+
+`gpt-6-astra` streams reasoning as OpenAI `reasoning_content` deltas and as
+Anthropic `thinking_delta` events when thinking is enabled. Reasoning quality
+and token use depend on the selected effort/budget; the adapter does not claim
+that its exposed summaries are the model's private chain of thought.
 
 ### Method 2: Cloudflare Workers (Serverless)
 

@@ -72,4 +72,20 @@ describe("clicreds", () => {
       await fs.rm(tmpDir, { recursive: true, force: true });
     }
   });
+
+  it("parses the official OmniRush CLI auth.json shape", () => {
+    const parsed = parseCredentialFileContent(
+      JSON.stringify({
+        accessToken: "omnirush-access",
+        refreshToken: "omnirush-refresh",
+        gatewayUrl: "https://omnirush.ai/omnirush",
+      }),
+      "/home/test/.omnirush/auth.json"
+    );
+
+    assert.ok(parsed);
+    assert.equal(parsed.refreshToken, "omnirush-refresh");
+    assert.equal(parsed.accessToken, "omnirush-access");
+    assert.equal(parsed.gatewayUrl, "https://omnirush.ai/omnirush/v1");
+  });
 });

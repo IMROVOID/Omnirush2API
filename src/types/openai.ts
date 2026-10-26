@@ -4,9 +4,11 @@
 
 export interface ChatMessage {
   readonly role: "system" | "user" | "assistant" | "tool";
-  readonly content: string | null;
+  readonly content: string | null | readonly unknown[];
   readonly name?: string;
   readonly reasoning_content?: string;
+  readonly tool_call_id?: string;
+  readonly tool_calls?: readonly unknown[];
 }
 
 export interface ChatCompletionRequest {
@@ -21,6 +23,9 @@ export interface ChatCompletionRequest {
   readonly frequency_penalty?: number;
   readonly user?: string;
   readonly reasoning_effort?: "none" | "low" | "medium" | "high" | "max";
+  readonly input?: readonly unknown[];
+  readonly store?: boolean;
+  readonly max_output_tokens?: number;
 }
 
 export interface ChatCompletionChoice {

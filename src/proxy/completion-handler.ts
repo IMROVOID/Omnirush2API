@@ -5,7 +5,7 @@ import type {
 import { resolveModelId } from "./model-catalog.js";
 import { AccountPoolManager, parseCooldownDuration } from "../auth/pool-manager.js";
 import { normalizeCompletionRequest, normalizeCompletionResponse } from "./normalizer.js";
-import { createSSETransformStream } from "./stream-transformer.js";
+import { aggregateResponsesSSE, createSSETransformStream } from "./stream-transformer.js";
 import { DEFAULT_GATEWAY_URL } from "../auth/oauth-client.js";
 import { createAntiBanHeaders, detectAccountBan } from "./wire-guard.js";
 
@@ -58,7 +58,10 @@ export class CompletionProxyHandler {
     const targetModel = resolveModelId(request.model);
     const normalizedPayload = normalizeCompletionRequest(request);
     const isStream = request.stream === true;
-    const maxAttempts = Math.max(1, this.pool.getStats().total);
+    // A 401 can mean the access token in a long-running daemon is stale. Give
+    // a single-account pool a second pass so AccountPoolManager can rotate the
+    // device token instead of returning a misleading 502 immediately.
+    const maxAttempts = Math.max(2, this.pool.getStats().total);
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       if (signal?.aborted) {
@@ -108,7 +111,9 @@ export class CompletionProxyHandler {
       const headers = createAntiBanHeaders({
         accessToken: account.accessToken ?? "",
         requestId,
-        isStream,
+        // The OmniRush Responses gateway currently requires stream=true for
+        // every model request. We aggregate it below for non-stream callers.
+        isStream: true,
       });
 
       const timeoutSignal = AbortSignal.timeout(this.requestTimeoutMs);
@@ -149,7 +154,7 @@ export class CompletionProxyHandler {
         // 2. 401 Unauthorized: token might be revoked or expired
         if (response.status === 401) {
           this.pool.invalidateAccountToken(account.id);
-          this.pool.markCooldown(account.id, 10_000, "HTTP 401 Unauthorized");
+          this.pool.markCooldown(account.id, 0, "HTTP 401 Unauthorized; refreshing access token");
           continue;
         }
 
@@ -164,7 +169,9 @@ export class CompletionProxyHandler {
         // Handle non-streaming response
         let parsedJson: unknown = {};
         try {
-          parsedJson = JSON.parse(responseText);
+          parsedJson = response.headers.get("content-type")?.includes("text/event-stream")
+            ? aggregateResponsesSSE(responseText, targetModel)
+            : JSON.parse(responseText);
         } catch {
           return {
             status: response.status,
@@ -195,6 +202,7 @@ export class CompletionProxyHandler {
           },
         };
       } catch (err) {
+        console.error(`[Omnirush2API] upstream request failed: ${err instanceof Error ? err.message : String(err)}`);
         if (signal?.aborted) {
           return {
             status: 499,

@@ -63,7 +63,7 @@ function getModelList() {
 }
 
 // src/proxy/wire-guard.ts
-var OFFICIAL_VERSION = "2.4.3";
+var OFFICIAL_VERSION = "2.7.0";
 var BAN_PATTERNS = [
   /closed\s+automatically/i,
   /unofficial\s+client/i,
@@ -108,7 +108,8 @@ function generateRealisticDeviceName() {
   return `DESKTOP-${suffix}`;
 }
 function createAntiBanHeaders(options) {
-  const sessionId = options.requestId ?? `sess-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+  const generated = typeof globalThis.crypto?.randomUUID === "function" ? globalThis.crypto.randomUUID().replaceAll("-", "") : `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 22)}`;
+  const sessionId = options.requestId?.startsWith("ses_") ? options.requestId : `ses_${generated}`;
   const headers = {
     "Content-Type": "application/json",
     Accept: options.isStream ? "text/event-stream" : "application/json",
@@ -551,9 +552,77 @@ var AccountPoolManager = class {
 };
 
 // src/proxy/normalizer.ts
+function blockText(value) {
+  if (typeof value === "string") return value;
+  if (!Array.isArray(value)) return value == null ? "" : JSON.stringify(value);
+  return value.map((part) => {
+    if (typeof part === "string") return part;
+    if (part && typeof part === "object" && typeof part.text === "string") return part.text;
+    return "";
+  }).join("");
+}
+function textParts(content, type, role) {
+  if (typeof content === "string") return [{ type, text: content }];
+  if (content === null) return [];
+  if (!Array.isArray(content)) return [];
+  const blocks = [];
+  for (const part of content) {
+    if (typeof part === "string") {
+      blocks.push({ type, text: part });
+      continue;
+    }
+    if (!part || typeof part !== "object") continue;
+    const value = part;
+    const kind = typeof value.type === "string" ? value.type : "text";
+    if (kind === "text") {
+      if (typeof value.text === "string") blocks.push({ type, text: value.text });
+      continue;
+    }
+    if (kind === "thinking" || kind === "redacted_thinking") continue;
+    if (kind === "tool_result") {
+      blocks.push({
+        type: "function_call_output",
+        call_id: typeof value.tool_use_id === "string" ? value.tool_use_id : "unknown",
+        output: blockText(value.content)
+      });
+      continue;
+    }
+    if (kind === "tool_use") {
+      blocks.push({
+        type: "function_call",
+        call_id: typeof value.id === "string" ? value.id : "unknown",
+        name: typeof value.name === "string" ? value.name : "tool",
+        arguments: typeof value.input === "string" ? value.input : JSON.stringify(value.input ?? {})
+      });
+      continue;
+    }
+    if (kind === "input_text" || kind === "output_text" || kind === "input_image" || kind === "image_url") {
+      blocks.push(value);
+      continue;
+    }
+    if (role === "user" && typeof value.text === "string") blocks.push({ type, text: value.text });
+  }
+  return blocks;
+}
+function normalizeInput(request) {
+  if (Array.isArray(request.input)) return request.input;
+  return request.messages.map((message) => {
+    if (message.role === "tool") {
+      return {
+        type: "function_call_output",
+        call_id: message.tool_call_id ?? "unknown",
+        output: typeof message.content === "string" ? message.content : JSON.stringify(message.content ?? "")
+      };
+    }
+    return {
+      role: message.role,
+      ...message.name ? { name: message.name } : {},
+      content: textParts(message.content, message.role === "assistant" ? "output_text" : "input_text", message.role)
+    };
+  });
+}
 function normalizeCompletionRequest(request) {
   const targetModel = resolveModelId(request.model);
-  const stream = request.stream === true;
   let reasoning;
   if (request.reasoning_effort) {
     reasoning = {
@@ -568,14 +637,17 @@ function normalizeCompletionRequest(request) {
   }
   return {
     model: targetModel,
-    messages: request.messages,
-    input: request.messages,
-    stream,
+    input: normalizeInput(request),
+    // The OmniRush Responses gateway requires streaming, even when the local
+    // OpenAI-compatible caller asks for a non-streaming chat completion.
+    stream: true,
+    store: false,
     ...typeof request.temperature === "number" ? { temperature: request.temperature } : {},
     ...typeof request.top_p === "number" ? { top_p: request.top_p } : {},
-    ...typeof request.max_tokens === "number" ? { max_tokens: request.max_tokens } : {},
+    ...typeof request.max_output_tokens === "number" ? { max_output_tokens: request.max_output_tokens } : typeof request.max_tokens === "number" ? { max_output_tokens: request.max_tokens } : {},
     ...request.stop ? { stop: request.stop } : {},
-    ...reasoning ? { reasoning } : {}
+    ...reasoning ? { reasoning } : {},
+    ...reasoning ? { include: ["reasoning.encrypted_content"] } : {}
   };
 }
 function normalizeCompletionResponse(raw, fallbackModel) {
@@ -601,13 +673,15 @@ function normalizeCompletionResponse(raw, fallbackModel) {
         finish_reason: c["finish_reason"] ?? "stop"
       };
     });
-  } else if (typeof data["output"] === "string") {
+  } else if (typeof data["content"] === "string" || typeof data["output"] === "string") {
+    const reasoning = typeof data["reasoningContent"] === "string" ? data["reasoningContent"] : void 0;
     choices = [
       {
         index: 0,
         message: {
           role: "assistant",
-          content: data["output"]
+          content: typeof data["content"] === "string" ? data["content"] : data["output"],
+          ...reasoning ? { reasoning_content: reasoning } : {}
         },
         finish_reason: "stop"
       }
@@ -680,7 +754,33 @@ function createChunkDelta(options) {
   };
 }
 function transformUpstreamChunk(upstream, requestedModel) {
-  const id = typeof upstream["id"] === "string" ? upstream["id"] : `chatcmpl-${Date.now()}`;
+  const response = upstream["response"] && typeof upstream["response"] === "object" ? upstream["response"] : null;
+  const id = typeof upstream["id"] === "string" ? upstream["id"] : response && typeof response["id"] === "string" ? response["id"] : `chatcmpl-${Date.now()}`;
+  const eventType = typeof upstream["type"] === "string" ? upstream["type"] : "";
+  if (eventType === "response.output_text.delta") {
+    return createChunkDelta({
+      id,
+      model: requestedModel,
+      content: typeof upstream["delta"] === "string" ? upstream["delta"] : ""
+    });
+  }
+  if (/^response\.(reasoning|summary).*\.delta$/.test(eventType)) {
+    return createChunkDelta({
+      id,
+      model: requestedModel,
+      reasoningContent: typeof upstream["delta"] === "string" ? upstream["delta"] : ""
+    });
+  }
+  if (eventType === "response.output_item.added") {
+    const item = upstream["item"];
+    if (item && typeof item === "object" && item["role"] === "assistant") {
+      return createChunkDelta({ id, model: requestedModel, role: "assistant" });
+    }
+    return null;
+  }
+  if (eventType === "response.completed") {
+    return createChunkDelta({ id, model: requestedModel, finishReason: "stop" });
+  }
   const choicesRaw = Array.isArray(upstream["choices"]) ? upstream["choices"] : [];
   if (choicesRaw.length > 0) {
     const choices = [];
@@ -736,6 +836,7 @@ function createSSETransformStream(requestedModel) {
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
   let buffer = "";
+  let responseId = `chatcmpl-${Date.now()}`;
   return new TransformStream({
     transform(chunk, controller) {
       buffer += decoder.decode(chunk, { stream: true });
@@ -748,7 +849,9 @@ function createSSETransformStream(requestedModel) {
           return;
         }
         if (parsed !== null) {
-          const transformed = transformUpstreamChunk(parsed, requestedModel);
+          const response = parsed.response && typeof parsed.response === "object" ? parsed.response : null;
+          if (response && typeof response.id === "string") responseId = response.id;
+          const transformed = transformUpstreamChunk({ id: responseId, ...parsed }, requestedModel);
           if (transformed !== null) {
             controller.enqueue(encoder.encode(formatSSEChunk(transformed)));
           }
@@ -761,7 +864,9 @@ function createSSETransformStream(requestedModel) {
         if (parsed === "[DONE]") {
           controller.enqueue(encoder.encode(SSE_DONE_MESSAGE));
         } else if (parsed !== null) {
-          const transformed = transformUpstreamChunk(parsed, requestedModel);
+          const response = parsed.response && typeof parsed.response === "object" ? parsed.response : null;
+          if (response && typeof response.id === "string") responseId = response.id;
+          const transformed = transformUpstreamChunk({ id: responseId, ...parsed }, requestedModel);
           if (transformed !== null) {
             controller.enqueue(encoder.encode(formatSSEChunk(transformed)));
           }
@@ -770,6 +875,60 @@ function createSSETransformStream(requestedModel) {
       controller.enqueue(encoder.encode(SSE_DONE_MESSAGE));
     }
   });
+}
+function responseOutputText(value) {
+  if (!Array.isArray(value)) return "";
+  const text = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object") continue;
+    const record = item;
+    const content = record.content;
+    if (!Array.isArray(content)) continue;
+    for (const part of content) {
+      if (part && typeof part === "object" && typeof part.text === "string") {
+        const partText = part.text;
+        if (typeof partText === "string") text.push(partText);
+      }
+    }
+  }
+  return text.join("");
+}
+function aggregateResponsesSSE(text, requestedModel) {
+  let id = `chatcmpl-${Date.now()}`;
+  let model = requestedModel;
+  let content = "";
+  let reasoningContent = "";
+  let usage;
+  for (const line of text.split(/\r?\n/)) {
+    const parsed = parseSSELine(line);
+    if (!parsed || parsed === "[DONE]") continue;
+    const type = typeof parsed.type === "string" ? parsed.type : "";
+    const response = parsed.response && typeof parsed.response === "object" ? parsed.response : null;
+    const eventId = typeof parsed.response_id === "string" ? parsed.response_id : response && typeof response.id === "string" ? response.id : null;
+    if (eventId) id = eventId;
+    const eventModel = response && typeof response.model === "string" ? response.model : null;
+    if (eventModel) model = eventModel;
+    if (type === "response.output_text.delta" && typeof parsed.delta === "string") content += parsed.delta;
+    if (/^response\.(reasoning|summary).*\.delta$/.test(type) && typeof parsed.delta === "string") reasoningContent += parsed.delta;
+    if (type === "response.completed" && response) {
+      if (!content) content = responseOutputText(response.output);
+      const rawUsage = response.usage;
+      if (rawUsage && typeof rawUsage === "object") {
+        const value = rawUsage;
+        const prompt = typeof value.input_tokens === "number" ? value.input_tokens : typeof value.prompt_tokens === "number" ? value.prompt_tokens : 0;
+        const completion = typeof value.output_tokens === "number" ? value.output_tokens : typeof value.completion_tokens === "number" ? value.completion_tokens : 0;
+        const total = typeof value.total_tokens === "number" ? value.total_tokens : prompt + completion;
+        usage = { prompt_tokens: prompt, completion_tokens: completion, total_tokens: total };
+      }
+    }
+  }
+  return {
+    id,
+    model,
+    content,
+    ...reasoningContent ? { reasoningContent } : {},
+    ...usage ? { usage } : {}
+  };
 }
 
 // src/proxy/completion-handler.ts
@@ -801,7 +960,7 @@ var CompletionProxyHandler = class {
     const targetModel = resolveModelId(request.model);
     const normalizedPayload = normalizeCompletionRequest(request);
     const isStream = request.stream === true;
-    const maxAttempts = Math.max(1, this.pool.getStats().total);
+    const maxAttempts = Math.max(2, this.pool.getStats().total);
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       if (signal?.aborted) {
         return {
@@ -845,7 +1004,9 @@ var CompletionProxyHandler = class {
       const headers = createAntiBanHeaders({
         accessToken: account.accessToken ?? "",
         requestId,
-        isStream
+        // The OmniRush Responses gateway currently requires stream=true for
+        // every model request. We aggregate it below for non-stream callers.
+        isStream: true
       });
       const timeoutSignal = AbortSignal.timeout(this.requestTimeoutMs);
       const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
@@ -876,7 +1037,7 @@ var CompletionProxyHandler = class {
         }
         if (response.status === 401) {
           this.pool.invalidateAccountToken(account.id);
-          this.pool.markCooldown(account.id, 1e4, "HTTP 401 Unauthorized");
+          this.pool.markCooldown(account.id, 0, "HTTP 401 Unauthorized; refreshing access token");
           continue;
         }
         if (response.status === 429) {
@@ -887,7 +1048,7 @@ var CompletionProxyHandler = class {
         }
         let parsedJson = {};
         try {
-          parsedJson = JSON.parse(responseText);
+          parsedJson = response.headers.get("content-type")?.includes("text/event-stream") ? aggregateResponsesSSE(responseText, targetModel) : JSON.parse(responseText);
         } catch {
           return {
             status: response.status,
@@ -915,6 +1076,7 @@ var CompletionProxyHandler = class {
           }
         };
       } catch (err) {
+        console.error(`[Omnirush2API] upstream request failed: ${err instanceof Error ? err.message : String(err)}`);
         if (signal?.aborted) {
           return {
             status: 499,
@@ -976,7 +1138,8 @@ var RequestDispatcher = class {
     if (this.config.apiKey && this.config.apiKey.trim() !== "") {
       const authHeader = req.headers.authorization;
       const expected = `Bearer ${this.config.apiKey}`;
-      if (authHeader !== expected) {
+      const apiKeyHeader = req.headers["x-api-key"];
+      if (authHeader !== expected && apiKeyHeader !== this.config.apiKey) {
         res.writeHead(401, { "Content-Type": "application/json" });
         res.end(
           JSON.stringify({
@@ -999,7 +1162,24 @@ var RequestDispatcher = class {
       return;
     }
     if (req.method === "POST" && (pathname === "/v1/chat/completions" || pathname === "/v1/responses")) {
-      await this.handleChatCompletions(req, res);
+      await this.handleChatCompletions(req, res, pathname === "/v1/responses");
+      return;
+    }
+    if (req.method === "POST" && pathname === "/v1/messages") {
+      await this.handleAnthropicMessages(req, res);
+      return;
+    }
+    if (req.method === "POST" && pathname === "/v1/messages/count_tokens") {
+      let rawBody = "";
+      try {
+        rawBody = await this.readRequestBody(req);
+        const payload = JSON.parse(rawBody);
+        const serialized = JSON.stringify({ system: payload.system, messages: payload.messages, tools: payload.tools });
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ input_tokens: Math.max(1, Math.ceil(serialized.length / 4)) }));
+      } catch {
+        this.writeJsonError(res, 400, "Malformed JSON payload in request body.");
+      }
       return;
     }
     res.writeHead(404, { "Content-Type": "application/json" });
@@ -1041,7 +1221,7 @@ var RequestDispatcher = class {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(getModelList(), null, 2));
   }
-  async handleChatCompletions(req, res) {
+  async handleChatCompletions(req, res, responsesApi = false) {
     let rawBody = "";
     try {
       rawBody = await this.readRequestBody(req);
@@ -1072,12 +1252,12 @@ var RequestDispatcher = class {
       );
       return;
     }
-    if (!payload.model || !Array.isArray(payload.messages)) {
+    if (!payload.model || !Array.isArray(payload.messages) && !responsesApi) {
       res.writeHead(400, { "Content-Type": "application/json" });
       res.end(
         JSON.stringify({
           error: {
-            message: "Missing required 'model' or 'messages' field.",
+            message: responsesApi ? "Missing required 'model' or 'input' field." : "Missing required 'model' or 'messages' field.",
             type: "invalid_request_error"
           }
         })
@@ -1088,7 +1268,10 @@ var RequestDispatcher = class {
     req.on("close", () => {
       abortController.abort();
     });
-    const result = await this.handler.handleCompletion(payload, abortController.signal);
+    const result = await this.handler.handleCompletion(
+      responsesApi ? this.responsesToChatRequest(payload) : payload,
+      abortController.signal
+    );
     if (result.isStream && result.streamResponse) {
       res.writeHead(200, {
         "Content-Type": "text/event-stream; charset=utf-8",
@@ -1115,6 +1298,191 @@ var RequestDispatcher = class {
     }
     res.writeHead(result.status, { "Content-Type": "application/json" });
     res.end(JSON.stringify(result.errorResponse ?? {}, null, 2));
+  }
+  responsesToChatRequest(payload) {
+    const input = payload.input;
+    const messages = Array.isArray(input) ? input.flatMap((item) => {
+      if (!item || typeof item !== "object") return [];
+      const value = item;
+      if (value.type === "message" || typeof value.role === "string") {
+        const content = Array.isArray(value.content) ? value.content : typeof value.content === "string" ? value.content : "";
+        return [{ role: value.role === "assistant" ? "assistant" : value.role === "system" ? "system" : "user", content }];
+      }
+      if (value.type === "function_call_output") {
+        return [{ role: "tool", tool_call_id: typeof value.call_id === "string" ? value.call_id : "unknown", content: typeof value.output === "string" ? value.output : JSON.stringify(value.output ?? "") }];
+      }
+      return [];
+    }) : [{ role: "user", content: typeof input === "string" ? input : JSON.stringify(input ?? "") }];
+    return { ...payload, messages };
+  }
+  async handleAnthropicMessages(req, res) {
+    let rawBody = "";
+    try {
+      rawBody = await this.readRequestBody(req);
+    } catch (error) {
+      this.writeJsonError(res, 400, `Failed to read request body: ${error instanceof Error ? error.message : String(error)}`);
+      return;
+    }
+    let payload;
+    try {
+      const parsed = JSON.parse(rawBody);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("body must be an object");
+      payload = parsed;
+    } catch {
+      this.writeJsonError(res, 400, "Malformed JSON payload in request body.");
+      return;
+    }
+    const request = this.anthropicToChatRequest(payload);
+    if (!request.model || !request.messages.length) {
+      this.writeJsonError(res, 400, "Missing required 'model' or 'messages' field.");
+      return;
+    }
+    const abortController = new AbortController();
+    req.on("close", () => abortController.abort());
+    const result = await this.handler.handleCompletion(request, abortController.signal);
+    if (result.errorResponse) {
+      res.writeHead(result.status, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(result.errorResponse));
+      return;
+    }
+    if (request.stream && result.streamResponse) {
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive"
+      });
+      await this.writeAnthropicStream(result.streamResponse, res, request.model);
+      return;
+    }
+    if (result.jsonResponse) {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(this.chatToAnthropicResponse(result.jsonResponse)));
+      return;
+    }
+    res.writeHead(result.status, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: { type: "api_error", message: "No response from upstream" } }));
+  }
+  anthropicToChatRequest(payload) {
+    const rawMessages = Array.isArray(payload.messages) ? payload.messages : [];
+    const messages = [];
+    if (typeof payload.system === "string" || Array.isArray(payload.system)) messages.push({ role: "system", content: payload.system });
+    for (const entry of rawMessages) {
+      if (!entry || typeof entry !== "object") continue;
+      const value = entry;
+      const role = value.role === "assistant" ? "assistant" : "user";
+      const content = typeof value.content === "string" ? value.content : Array.isArray(value.content) ? value.content : "";
+      messages.push({ role, content });
+    }
+    const maxTokens = typeof payload.max_tokens === "number" ? payload.max_tokens : void 0;
+    const stopSequences = Array.isArray(payload.stop_sequences) ? payload.stop_sequences.filter((value) => typeof value === "string") : void 0;
+    const thinking = payload.thinking && typeof payload.thinking === "object" ? payload.thinking : null;
+    const budget = typeof thinking?.budget_tokens === "number" ? thinking.budget_tokens : 0;
+    const reasoning_effort = thinking?.type === "enabled" ? budget >= 16e3 ? "max" : budget >= 8e3 ? "high" : budget >= 4e3 ? "medium" : "low" : void 0;
+    return {
+      model: typeof payload.model === "string" ? payload.model : "",
+      messages,
+      stream: payload.stream === true,
+      ...typeof payload.temperature === "number" ? { temperature: payload.temperature } : {},
+      ...typeof payload.top_p === "number" ? { top_p: payload.top_p } : {},
+      ...maxTokens !== void 0 ? { max_tokens: maxTokens } : {},
+      ...stopSequences && stopSequences.length ? { stop: stopSequences } : {},
+      ...reasoning_effort ? { reasoning_effort } : {}
+    };
+  }
+  chatToAnthropicResponse(response) {
+    const choice = response.choices[0];
+    const content = choice?.message.content;
+    const text = typeof content === "string" ? content : content == null ? "" : JSON.stringify(content);
+    const reasoning = choice?.message.reasoning_content;
+    const blocks = [
+      ...reasoning ? [{ type: "thinking", thinking: reasoning }] : [],
+      { type: "text", text }
+    ];
+    return {
+      id: response.id.startsWith("msg_") ? response.id : `msg_${response.id}`,
+      type: "message",
+      role: "assistant",
+      model: response.model,
+      content: blocks,
+      stop_reason: choice?.finish_reason === "length" ? "max_tokens" : "end_turn",
+      stop_sequence: null,
+      usage: {
+        input_tokens: response.usage?.prompt_tokens ?? 0,
+        output_tokens: response.usage?.completion_tokens ?? 0
+      }
+    };
+  }
+  async writeAnthropicStream(stream, res, model) {
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let messageId = `msg_${Date.now()}`;
+    let nextBlockIndex = 0;
+    let thinkingBlockIndex = null;
+    let textBlockIndex = null;
+    let finished = false;
+    const send = (event, data) => {
+      res.write(`event: ${event}
+data: ${JSON.stringify(data)}
+
+`);
+    };
+    send("message_start", {
+      type: "message_start",
+      message: { id: messageId, type: "message", role: "assistant", model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } }
+    });
+    const handleLine = (line) => {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("data:")) return;
+      try {
+        const chunk = JSON.parse(trimmed.slice(5).trim());
+        if (typeof chunk.id === "string") messageId = chunk.id;
+        const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
+        const first = choices[0] && typeof choices[0] === "object" ? choices[0] : null;
+        const delta = first?.delta && typeof first.delta === "object" ? first.delta : null;
+        if (typeof delta?.reasoning_content === "string") {
+          if (thinkingBlockIndex === null) {
+            thinkingBlockIndex = nextBlockIndex++;
+            send("content_block_start", { type: "content_block_start", index: thinkingBlockIndex, content_block: { type: "thinking", thinking: "" } });
+          }
+          send("content_block_delta", { type: "content_block_delta", index: thinkingBlockIndex, delta: { type: "thinking_delta", thinking: delta.reasoning_content } });
+        }
+        if (typeof delta?.content === "string") {
+          if (textBlockIndex === null) {
+            textBlockIndex = nextBlockIndex++;
+            send("content_block_start", { type: "content_block_start", index: textBlockIndex, content_block: { type: "text", text: "" } });
+          }
+          send("content_block_delta", { type: "content_block_delta", index: textBlockIndex, delta: { type: "text_delta", text: delta.content } });
+        }
+        const finish = typeof first?.finish_reason === "string" ? first.finish_reason : null;
+        if (finish && !finished) {
+          finished = true;
+          if (thinkingBlockIndex !== null) send("content_block_stop", { type: "content_block_stop", index: thinkingBlockIndex });
+          if (textBlockIndex !== null) send("content_block_stop", { type: "content_block_stop", index: textBlockIndex });
+          send("message_delta", { type: "message_delta", delta: { stop_reason: finish === "length" ? "max_tokens" : "end_turn", stop_sequence: null }, usage: { output_tokens: 0 } });
+          send("message_stop", { type: "message_stop" });
+        }
+      } catch {
+      }
+    };
+    try {
+      const reader = stream.getReader();
+      while (true) {
+        const next = await reader.read();
+        if (next.done) break;
+        const chunk = next.value;
+        buffer += decoder.decode(chunk, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+        for (const line of lines) handleLine(line);
+      }
+      if (buffer) handleLine(buffer);
+    } finally {
+      res.end();
+    }
+  }
+  writeJsonError(res, status, message) {
+    res.writeHead(status, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: { message, type: "invalid_request_error" } }));
   }
   readRequestBody(req, maxBytes = 25 * 1024 * 1024) {
     return new Promise((resolve, reject) => {
@@ -1178,6 +1546,12 @@ async function startHttpServer(config, pool) {
 import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
+function normalizeGatewayUrl(value) {
+  if (!value) return void 0;
+  const trimmed = value.trim().replace(/\/+$/, "");
+  if (!trimmed) return void 0;
+  return trimmed.endsWith("/v1") ? trimmed : `${trimmed}/v1`;
+}
 function parseCredentialFileContent(content, sourcePath) {
   const trimmed = content.trim();
   if (!trimmed) {
@@ -1197,7 +1571,7 @@ function parseCredentialFileContent(content, sourcePath) {
       path: sourcePath,
       refreshToken: refreshToken.trim(),
       accessToken: accessToken?.trim(),
-      gatewayUrl: gatewayUrl?.trim(),
+      gatewayUrl: normalizeGatewayUrl(gatewayUrl),
       email: email?.trim()
     };
   } catch {
@@ -1237,6 +1611,7 @@ function getStandardCredentialPaths() {
     );
   }
   paths.push(path.join(home, ".omnirush2api", "tokens.json"));
+  paths.push(path.join(home, ".omnirush", "auth.json"));
   return paths;
 }
 async function findLocalCredentials(options = {}) {
